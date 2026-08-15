@@ -162,17 +162,19 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl tar gzip nodejs
 
+      - name: Checkout upstream tag (for the smoke test script)
+        # NOTE: checkout cleans the workspace — must run BEFORE the artifact
+        # download, otherwise the downloaded tarball is deleted.
+        uses: actions/checkout@v6
+        with:
+          repository: 'iOfficeAI/AionUi'
+          ref: ${{ needs.build.outputs.tag }}
+
       - name: Download tarball
         uses: actions/download-artifact@v7
         with:
           name: aionui-web-linux-x86_64
           path: dist-web-cli
-
-      - name: Checkout upstream tag (for the smoke test script)
-        uses: actions/checkout@v6
-        with:
-          repository: 'iOfficeAI/AionUi'
-          ref: ${{ needs.build.outputs.tag }}
 
       - name: Run upstream smoke test
         run: |

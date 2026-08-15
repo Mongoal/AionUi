@@ -1,0 +1,180 @@
+# Manual single-platform web build for the self-hosted AionUi container.
+#
+# Why this exists: upstream stopped publishing installer assets on GitHub
+# Releases after v2.1.47-final (PR #3868 — builds moved behind the official
+# website / AionPro). This workflow rebuilds the headless web bundle
+# (aionui-web-<ver>-linux-x86_64.tar.gz, the artifact our NAS container image
+# is built from) from upstream source tags, on demand.
+#
+# Flow: resolve tag (input, or latest upstream release) → fetch upstream tags
+# into this fork → checkout the tag → apply optional patches from
+# build-patches/ → build renderer → pack web-cli tarball (bundles aioncore,
+# pinned via package.json "aioncoreVersion") → upload artifact.
+#
+# Patches (optional): place *.patch files on this branch under
+#   build-patches/common/          — applied to every build
+#   build-patches/<tag>/           — applied only for that tag (e.g. v2.1.56)
+#   build-patches/<version>/       — same, without the leading "v"
+# Created with `git diff > foo.patch` from a working tree based on that tag.
+
+name: Build Web (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream release tag to build (empty = latest upstream release)'
+        type: string
+        default: ''
+      smoke_test:
+        description: 'Boot the tarball in debian:bookworm-slim after build'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  BUN_INSTALL_REGISTRY: 'https://registry.npmjs.org/'
+  UPSTREAM: 'iOfficeAI/AionUi'
+
+jobs:
+  build:
+    name: aionui-web linux-x86_64
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      asset_version: ${{ steps.meta.outputs.asset_version }}
+    steps:
+      - name: Checkout fork (carrier branch for this workflow + patches)
+        uses: actions/checkout@v6
+
+      - name: Stash build patches for later
+        run: |
+          mkdir -p "$RUNNER_TEMP/build-patches"
+          if [ -d build-patches ]; then
+            cp -r build-patches/. "$RUNNER_TEMP/build-patches/"
+            echo "patch files on carrier branch:"
+            find "$RUNNER_TEMP/build-patches" -name '*.patch' -printf '  %P\n' || true
+          fi
+
+      - name: Resolve target tag
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name) \
+              || { echo "::error::failed to resolve latest upstream release"; exit 1; }
+          fi
+          case "$TAG" in
+            v*) VERSION="${TAG#v}" ;;
+            *)  VERSION="$TAG" ;;
+          esac
+          ASSET_VERSION="${VERSION%-final}"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "asset_version=$ASSET_VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "target: $UPSTREAM $TAG (asset version $ASSET_VERSION)"
+
+      - name: Fetch upstream tags and checkout target
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch upstream 'refs/tags/*:refs/tags/*' --no-tags --force
+          git checkout --detach "${{ steps.meta.outputs.tag }}"
+          git log -1 --format 'building %h: %s'
+
+      - name: Apply patches (optional)
+        run: |
+          base="$RUNNER_TEMP/build-patches"
+          applied=0
+          for dir in common "${{ steps.meta.outputs.tag }}" "${{ steps.meta.outputs.version }}"; do
+            d="$base/$dir"
+            [ -d "$d" ] || continue
+            shopt -s nullglob
+            for p in "$d"/*.patch; do
+              echo "applying $dir/$(basename "$p")"
+              git apply --check "$p" \
+                || { echo "::error::$dir/$(basename "$p") does not apply cleanly"; exit 1; }
+              git apply "$p"
+              applied=$((applied+1))
+            done
+          done
+          echo "patches applied: $applied"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run postinstall
+        run: bun run postinstall || true
+
+      - name: Build desktop renderer (static files for the web bundle)
+        run: bunx electron-vite build --config packages/desktop/electron.vite.config.ts
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+
+      - name: Pack web-cli tarball (linux-x64, bundles pinned aioncore)
+        run: node scripts/pack-web-cli.js
+        env:
+          PACK_PLATFORM: linux
+          PACK_ARCH: x64
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show produced files
+        run: ls -la dist-web-cli/
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: aionui-web-linux-x86_64
+          path: |
+            dist-web-cli/*.tar.gz
+            dist-web-cli/*.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+  smoke:
+    name: smoke test (debian boot check)
+    needs: build
+    if: ${{ inputs.smoke_test }}
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm-slim
+    steps:
+      - name: Install test deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl tar gzip nodejs
+
+      - name: Download tarball
+        uses: actions/download-artifact@v7
+        with:
+          name: aionui-web-linux-x86_64
+          path: dist-web-cli
+
+      - name: Checkout upstream tag (for the smoke test script)
+        uses: actions/checkout@v6
+        with:
+          repository: 'iOfficeAI/AionUi'
+          ref: ${{ needs.build.outputs.tag }}
+
+      - name: Run upstream smoke test
+        run: |
+          TARBALL=$(ls dist-web-cli/*.tar.gz | head -1)
+          bash scripts/smoke-test-web-cli.sh "$TARBALL"

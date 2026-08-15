@@ -88,7 +88,7 @@ jobs:
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch upstream 'refs/tags/*:refs/tags/*' --no-tags --force
           git checkout --detach "${{ steps.meta.outputs.tag }}"
-          git log -1 --format 'building %h: %s'
+          git log -1 --oneline
 
       - name: Apply patches (optional)
         run: |

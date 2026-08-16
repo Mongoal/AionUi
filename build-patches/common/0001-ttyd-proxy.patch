@@ -1,0 +1,71 @@
+diff --git a/packages/web-host/src/static-server.ts b/packages/web-host/src/static-server.ts
+index 8f89648..101b96e 100644
+--- a/packages/web-host/src/static-server.ts
++++ b/packages/web-host/src/static-server.ts
+@@ -117,6 +117,38 @@ function peekWsRoute(buf: Buffer): boolean | null {
+   return /^GET\s+\/(?:ws|api\/stt\/stream)(?:\?[^\s]*)?\s+HTTP\/1\.[01]\r?$/.test(firstLine);
+ }
+ 
++// --- ttyd sidecar proxy (self-hosted addition; no-op unless TTYD_PORT is set) ---
++// Forwards /ttyd/* (HTTP + WebSocket) to a ttyd process listening on 127.0.0.1,
++// injecting HTTP Basic credentials server-side so the browser never sees them.
++// Header names are lowercase on purpose: Node lowercases incoming headers, and
++// HTTP/1.1 header names are case-insensitive on the wire.
++const TTYD_PORT = Number(process.env.TTYD_PORT ?? 0);
++const TTYD_CREDENTIAL = (() => {
++  const user = process.env.TTYD_USER;
++  const pass = process.env.TTYD_PASS;
++  if (!TTYD_PORT || !user || !pass) return '';
++  return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
++})();
++
++/** Inject the Authorization header right after the request line of `buf`. */
++function ttydInjectAuth(buf: Buffer): Buffer {
++  const newlineIdx = buf.indexOf(0x0a);
++  if (newlineIdx < 0 || !TTYD_CREDENTIAL) return buf;
++  return Buffer.concat([
++    buf.slice(0, newlineIdx + 1),
++    Buffer.from(`authorization: ${TTYD_CREDENTIAL}\r\n`, 'utf8'),
++    buf.slice(newlineIdx + 1),
++  ]);
++}
++
++/** `true` when the request line targets the /ttyd sidecar (GET, any sub-path). */
++function peekTtydRoute(buf: Buffer): boolean | null {
++  const newlineIdx = buf.indexOf(0x0a);
++  if (newlineIdx < 0) return null;
++  const firstLine = buf.slice(0, newlineIdx).toString('ascii');
++  return /^GET\s+\/ttyd(?:\/[^\s]*)?(?:\?[^\s]*)?\s+HTTP\/1\.[01]\r?$/.test(firstLine);
++}
++
+ export async function startStaticServer(opts: StaticServerOptions): Promise<StaticServerHandle> {
+   const port = opts.port ?? DEFAULT_PORT;
+   const allowRemote = opts.allowRemote === true;
+@@ -146,6 +178,14 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+         return;
+       }
+ 
++      // /ttyd/* — proxy to the ttyd sidecar (self-hosted addition). Credentials
++      // are injected here (server-side) so the browser never prompts for them.
++      if (TTYD_PORT && (req.url.startsWith('/ttyd/') || req.url === '/ttyd')) {
++        if (TTYD_CREDENTIAL) req.headers['authorization'] = TTYD_CREDENTIAL;
++        forwardToBackend(req, res, TTYD_PORT);
++        return;
++      }
++
+       // static files + SPA fallback
+       await serveHandler(req, res, {
+         public: opts.staticDir,
+@@ -193,6 +233,12 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+       const decision = peekWsRoute(peeked);
+       if (decision === null && peeked.length < PEEK_LIMIT_BYTES) return;
+       cleanup();
++      // ttyd WS upgrades splice straight to the sidecar with Basic auth
++      // injected into the replayed request head (self-hosted addition).
++      if (TTYD_PORT && peekTtydRoute(peeked) === true) {
++        spliceToTcpEndpoint(client, TTYD_PORT, ttydInjectAuth(peeked));
++        return;
++      }
+       const target = decision === true ? opts.backendPort : internalPort;
+       spliceToTcpEndpoint(client, target, peeked);
+     };

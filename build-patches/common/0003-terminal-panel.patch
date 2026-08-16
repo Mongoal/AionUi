@@ -1,9 +1,9 @@
 diff --git a/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderTerminalEntry.tsx b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderTerminalEntry.tsx
 new file mode 100644
-index 0000000..f4dc059
+index 0000000..012e845
 --- /dev/null
 +++ b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderTerminalEntry.tsx
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,110 @@
 +/**
 + * @license
 + * Copyright 2026 AionUi (aionui.com)
@@ -13,12 +13,13 @@ index 0000000..f4dc059
 +// Self-hosted addition (build-patches/common/0003-terminal-panel): a sider
 +// entry that opens an in-app terminal panel. The panel embeds the ttyd sidecar
 +// served at /ttyd/ by the patched static-server — credentials are injected
-+// server-side, the browser never sees them. Not an upstream component; the
-+// label is intentionally hardcoded (no i18n keys) to keep the patch free of
-+// locale-file churn.
++// server-side, the browser never sees them. ttyd spawns tmux (`new -A -s main`),
++// so the shell survives disconnects, drawer closes and page reloads. Not an
++// upstream component; the label is intentionally hardcoded (no i18n keys) to
++// keep the patch free of locale-file churn.
 +
 +import React, { useState } from 'react';
-+import { Drawer, Tooltip } from '@arco-design/web-react';
++import { Button, Drawer, Tooltip } from '@arco-design/web-react';
 +import { Terminal } from '@icon-park/react';
 +import classNames from 'classnames';
 +import type { SiderTooltipProps } from '@renderer/utils/ui/siderTooltip';
@@ -30,8 +31,8 @@ index 0000000..f4dc059
 +};
 +
 +/** Right-side drawer hosting the ttyd terminal. Closing only hides the iframe
-+ * (Arco Drawer keeps children mounted by default), so the shell session
-+ * survives close/reopen — it is lost only on a full page reload. */
++ * (Arco Drawer keeps children mounted by default) and the shell lives in tmux
++ * server-side anyway — close/reopen/backgrounding never lose the session. */
 +const TerminalPanel: React.FC<TerminalPanelProps> = ({ open, onClose, isMobile }) => (
 +  <Drawer
 +    title='终端'
@@ -42,12 +43,20 @@ index 0000000..f4dc059
 +    footer={null}
 +    bodyStyle={{ padding: 0 }}
 +  >
-+    <iframe
-+      src='/ttyd/'
-+      title='terminal'
-+      className='w-full h-full border-none bg-black'
-+      allow='clipboard-read; clipboard-write'
-+    />
++    <div className='relative w-full h-full'>
++      <iframe
++        src='/ttyd/'
++        title='terminal'
++        className='absolute inset-0 w-full h-full border-none bg-black'
++        allow='clipboard-read; clipboard-write'
++      />
++      {/* Floating collapse button: on mobile the fullscreen drawer covers the
++          whole UI — this is the only way out that keeps the session (it lives
++          in tmux server-side, closing only hides the iframe). */}
++      <Button size='mini' onClick={onClose} className='absolute top-8px right-8px z-10' style={{ opacity: 0.85 }}>
++        收起
++      </Button>
++    </div>
 +  </Drawer>
 +);
 +

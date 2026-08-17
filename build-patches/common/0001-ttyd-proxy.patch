@@ -1,8 +1,8 @@
 diff --git a/packages/web-host/src/static-server.ts b/packages/web-host/src/static-server.ts
-index 8f89648..101b96e 100644
+index 8f89648..eff82f2 100644
 --- a/packages/web-host/src/static-server.ts
 +++ b/packages/web-host/src/static-server.ts
-@@ -117,6 +117,38 @@ function peekWsRoute(buf: Buffer): boolean | null {
+@@ -117,6 +117,75 @@ function peekWsRoute(buf: Buffer): boolean | null {
    return /^GET\s+\/(?:ws|api\/stt\/stream)(?:\?[^\s]*)?\s+HTTP\/1\.[01]\r?$/.test(firstLine);
  }
  
@@ -38,16 +38,60 @@ index 8f89648..101b96e 100644
 +  return /^GET\s+\/ttyd(?:\/[^\s]*)?(?:\?[^\s]*)?\s+HTTP\/1\.[01]\r?$/.test(firstLine);
 +}
 +
++/**
++ * Ask the backend whether `cookieHeader` carries a logged-in aionui session
++ * (GET /api/auth/user answers 401 without one). The ttyd sidecar sits behind
++ * this check plus the injected Basic credentials, so reaching the shell
++ * requires an authenticated WebUI session even if TTYD_USER/PASS leaked.
++ */
++function backendSessionValid(cookieHeader: string | undefined, backendPort: number): Promise<boolean> {
++  return new Promise((resolve) => {
++    const probe = http.request(
++      {
++        hostname: '127.0.0.1',
++        port: backendPort,
++        path: '/api/auth/user',
++        method: 'GET',
++        headers: cookieHeader ? { cookie: cookieHeader } : {},
++      },
++      (res) => {
++        res.resume(); // drain the body
++        resolve((res.statusCode ?? 0) === 200);
++      }
++    );
++    probe.on('error', () => resolve(false));
++    probe.end();
++  });
++}
++
++/** Extract a request header value from a raw peeked header block. */
++function peekHeaderValue(buf: Buffer, name: string): string | undefined {
++  for (const line of buf.toString('latin1').split('\r\n')) {
++    const idx = line.indexOf(':');
++    if (idx > 0 && line.slice(0, idx).trim().toLowerCase() === name) {
++      return line.slice(idx + 1).trim();
++    }
++  }
++  return undefined;
++}
++
  export async function startStaticServer(opts: StaticServerOptions): Promise<StaticServerHandle> {
    const port = opts.port ?? DEFAULT_PORT;
    const allowRemote = opts.allowRemote === true;
-@@ -146,6 +178,14 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+@@ -146,6 +215,21 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
          return;
        }
  
-+      // /ttyd/* — proxy to the ttyd sidecar (self-hosted addition). Credentials
-+      // are injected here (server-side) so the browser never prompts for them.
++      // /ttyd/* — proxy to the ttyd sidecar (self-hosted addition). Gated on a
++      // logged-in aionui session first, then Basic credentials are injected
++      // here (server-side) so the browser never prompts for them.
 +      if (TTYD_PORT && (req.url.startsWith('/ttyd/') || req.url === '/ttyd')) {
++        const sessionOk = await backendSessionValid(req.headers.cookie, opts.backendPort);
++        if (!sessionOk) {
++          res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
++          res.end('unauthorized');
++          return;
++        }
 +        if (TTYD_CREDENTIAL) req.headers['authorization'] = TTYD_CREDENTIAL;
 +        forwardToBackend(req, res, TTYD_PORT);
 +        return;
@@ -56,16 +100,28 @@ index 8f89648..101b96e 100644
        // static files + SPA fallback
        await serveHandler(req, res, {
          public: opts.staticDir,
-@@ -193,6 +233,12 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+@@ -190,6 +274,24 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+     };
+     const onData = (chunk: Buffer): void => {
+       peeked = Buffer.concat([peeked, chunk]);
++      // ttyd traffic (GET /ttyd*) splices to the sidecar, but only after the
++      // full header block arrives (we need the session cookie) and the backend
++      // confirms a logged-in session; Basic auth is injected server-side into
++      // the replayed head (self-hosted addition).
++      if (TTYD_PORT && peekTtydRoute(peeked) === true) {
++        if (!peeked.includes('\r\n\r\n') && peeked.length < PEEK_LIMIT_BYTES) return;
++        cleanup();
++        const cookie = peekHeaderValue(peeked, 'cookie');
++        void backendSessionValid(cookie, opts.backendPort).then((sessionOk) => {
++          if (!sessionOk) {
++            client.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 13\r\nConnection: close\r\n\r\nunauthorized\n');
++            client.end();
++            return;
++          }
++          spliceToTcpEndpoint(client, TTYD_PORT, ttydInjectAuth(peeked));
++        });
++        return;
++      }
        const decision = peekWsRoute(peeked);
        if (decision === null && peeked.length < PEEK_LIMIT_BYTES) return;
        cleanup();
-+      // ttyd WS upgrades splice straight to the sidecar with Basic auth
-+      // injected into the replayed request head (self-hosted addition).
-+      if (TTYD_PORT && peekTtydRoute(peeked) === true) {
-+        spliceToTcpEndpoint(client, TTYD_PORT, ttydInjectAuth(peeked));
-+        return;
-+      }
-       const target = decision === true ? opts.backendPort : internalPort;
-       spliceToTcpEndpoint(client, target, peeked);
-     };

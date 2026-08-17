@@ -1,0 +1,381 @@
+diff --git a/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx
+new file mode 100644
+index 0000000..7a0f21b
+--- /dev/null
++++ b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx
+@@ -0,0 +1,354 @@
++/**
++ * @license
++ * Copyright 2026 AionUi (aionui.com)
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++// Self-hosted addition (build-patches/common/0005-scripts-panel): a sider
++// entry opening a panel that runs and visualizes custom scripts living in
++// /data/scripts.d (a mounted volume), through the patched static-server's
++// local /api/scripts/* routes — same aionui session gate as the rest of the
++// WebUI. A script's last stdout line may be a view JSON: {type:"table"} renders
++// an Arco Table, {type:"progress"} renders progress bars plus an optional
++// detail table; anything else falls back to a <pre>. Optional stdin is sent on
++// run and remembered per script in localStorage. Not an upstream component;
++// labels are intentionally hardcoded (no i18n keys) to keep the patch
++// conflict-free — same rationale as 0003-terminal-panel.
++
++import React, { useCallback, useEffect, useRef, useState } from 'react';
++import { Button, Drawer, Empty, Input, Progress, Table, Tag, Tooltip } from '@arco-design/web-react';
++import { Command } from '@icon-park/react';
++import classNames from 'classnames';
++import type { SiderTooltipProps } from '@renderer/utils/ui/siderTooltip';
++
++const { TextArea } = Input;
++
++type ScriptInfo = {
++  name: string;
++  meta?: { name?: string; desc?: string };
++  running?: boolean;
++  startedAt?: number;
++  exitCode?: number | null;
++};
++
++type OutputState = { name: string; running?: boolean; exitCode?: number | null; content: string };
++
++type TableSpec = { columns: string[]; rows: string[][] };
++type ProgressItem = { label?: string; value?: number; detail?: string; status?: string };
++type ScriptView = { kind: 'table'; table: TableSpec } | { kind: 'progress'; items: ProgressItem[]; table?: TableSpec };
++
++const PROGRESS_STATUS: Record<string, 'normal' | 'success' | 'warning' | 'error'> = {
++  normal: 'normal',
++  success: 'success',
++  warning: 'warning',
++  danger: 'error', // script-side "danger" maps onto Arco's "error"
++  error: 'error',
++};
++
++/** Parse a view JSON from the last non-empty output line, if any. */
++function parseView(content: string): ScriptView | null {
++  const lines = content.trimEnd().split('\n');
++  const last = lines[lines.length - 1]?.trim();
++  if (!last || !last.startsWith('{')) return null;
++  try {
++    const v = JSON.parse(last) as Record<string, unknown>;
++    if (v.type === 'table' && Array.isArray(v.columns) && Array.isArray(v.rows)) {
++      return {
++        kind: 'table',
++        table: {
++          columns: v.columns.map(String),
++          rows: (v.rows as unknown[][]).map((row) => row.map((cell) => String(cell ?? ''))),
++        },
++      };
++    }
++    if (v.type === 'progress') {
++      const items: ProgressItem[] = Array.isArray(v.items)
++        ? (v.items as Record<string, unknown>[]).map((it) => ({
++            label: it.label === undefined ? undefined : String(it.label),
++            value: typeof it.value === 'number' ? it.value : undefined,
++            detail: it.detail === undefined ? undefined : String(it.detail),
++            status: it.status === undefined ? undefined : String(it.status),
++          }))
++        : [];
++      const t = v.table as Record<string, unknown> | undefined;
++      const table =
++        t && Array.isArray(t.columns) && Array.isArray(t.rows)
++          ? { columns: t.columns.map(String), rows: (t.rows as unknown[][]).map((row) => row.map((cell) => String(cell ?? ''))) }
++          : undefined;
++      return { kind: 'progress', items, table };
++    }
++    return null;
++  } catch {
++    return null;
++  }
++}
++
++const TableView: React.FC<{ spec: TableSpec }> = ({ spec }) => (
++  <Table
++    columns={spec.columns.map((title, i) => ({ title, dataIndex: String(i) }))}
++    data={spec.rows.map((row) => Object.fromEntries(row.map((cell, j) => [String(j), cell])))}
++    pagination={false}
++    size='small'
++    border={false}
++    borderCell
++  />
++);
++
++const ProgressView: React.FC<{ items: ProgressItem[]; table?: TableSpec }> = ({ items, table }) => (
++  <div className='flex flex-col gap-12px'>
++    {items.map((item, i) => (
++      <div key={i}>
++        <div className='flex justify-between items-baseline text-13px mb-2px'>
++          <span className='text-t-primary font-500'>{item.label ?? ''}</span>
++          <span className='text-t-secondary'>{item.detail ?? ''}</span>
++        </div>
++        <Progress
++          percent={Math.min(Math.max(item.value ?? 0, 0), 100)}
++          status={PROGRESS_STATUS[item.status ?? ''] ?? 'normal'}
++          showText
++        />
++      </div>
++    ))}
++    {table && <TableView spec={table} />}
++  </div>
++);
++
++/** Render script output: view JSON if the last line parses as one, else raw. */
++const OutputView: React.FC<{ output: OutputState }> = ({ output }) => {
++  const view = output.running ? null : parseView(output.content);
++  if (view?.kind === 'table') return <TableView spec={view.table} />;
++  if (view?.kind === 'progress') return <ProgressView items={view.items} table={view.table} />;
++  return (
++    <pre className='text-12px whitespace-pre-wrap [overflow-wrap:anywhere] max-h-360px overflow-auto bg-fill-1 rd-6px p-8px m-0'>
++      {output.content || '（暂无输出）'}
++    </pre>
++  );
++};
++
++const stdinStorageKey = (name: string): string => `aionui.script.stdin.${name}`;
++
++const ScriptsPanel: React.FC<{ open: boolean; onClose: () => void; isMobile: boolean }> = ({ open, onClose, isMobile }) => {
++  const [scripts, setScripts] = useState<ScriptInfo[]>([]);
++  const [outputs, setOutputs] = useState<Record<string, OutputState>>({});
++  const [stdins, setStdins] = useState<Record<string, string>>({});
++  const timers = useRef<Partial<Record<string, ReturnType<typeof setInterval>>>>({});
++
++  const refreshList = useCallback(async () => {
++    try {
++      const res = await fetch('/api/scripts/list');
++      if (res.ok) setScripts(((await res.json()) as { scripts?: ScriptInfo[] }).scripts ?? []);
++    } catch {
++      /* session expired / server restart — next open retries */
++    }
++  }, []);
++
++  const fetchOutput = useCallback(async (name: string): Promise<OutputState | null> => {
++    try {
++      const res = await fetch(`/api/scripts/output?name=${encodeURIComponent(name)}`);
++      return res.ok ? ((await res.json()) as OutputState) : null;
++    } catch {
++      return null;
++    }
++  }, []);
++
++  const stopPolling = useCallback((name: string) => {
++    const t = timers.current[name];
++    if (t !== undefined) clearInterval(t);
++    delete timers.current[name];
++  }, []);
++
++  const startPolling = useCallback(
++    (name: string) => {
++      stopPolling(name);
++      timers.current[name] = setInterval(async () => {
++        const out = await fetchOutput(name);
++        if (!out) return; // transient error — keep polling, list refresh recovers
++        setOutputs((prev) => ({ ...prev, [name]: out }));
++        if (!out.running) {
++          stopPolling(name);
++          void refreshList();
++        }
++      }, 1000);
++    },
++    [fetchOutput, refreshList, stopPolling]
++  );
++
++  // On open: load the list, restore stdin memories, fetch last outputs and
++  // resume polling for scripts that are still running.
++  useEffect(() => {
++    if (!open) return;
++    void refreshList();
++    void (async () => {
++      const res = await fetch('/api/scripts/list');
++      if (!res.ok) return;
++      for (const s of ((await res.json()) as { scripts?: ScriptInfo[] }).scripts ?? []) {
++        let saved: string | null = null;
++        try {
++          saved = localStorage.getItem(stdinStorageKey(s.name));
++        } catch {
++          /* private mode */
++        }
++        if (saved !== null) setStdins((prev) => ({ ...prev, [s.name]: saved }));
++        const out = await fetchOutput(s.name);
++        if (out) {
++          setOutputs((prev) => ({ ...prev, [s.name]: out }));
++          if (out.running) startPolling(s.name);
++        }
++      }
++    })();
++  }, [open, fetchOutput, refreshList, startPolling]);
++
++  // On close: stop all polling (outputs stay in state for the next open).
++  useEffect(() => {
++    if (!open) for (const name of Object.keys(timers.current)) stopPolling(name);
++  }, [open, stopPolling]);
++
++  useEffect(() => () => {
++    for (const name of Object.keys(timers.current)) stopPolling(name);
++  }, [stopPolling]);
++
++  const setStdin = (name: string, value: string): void => {
++    setStdins((prev) => ({ ...prev, [name]: value }));
++    try {
++      localStorage.setItem(stdinStorageKey(name), value);
++    } catch {
++      /* private mode — memory-only */
++    }
++  };
++
++  const handleRun = async (name: string): Promise<void> => {
++    try {
++      const res = await fetch('/api/scripts/run', {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ name, stdin: stdins[name] ?? '' }),
++      });
++      if (res.ok || res.status === 409) startPolling(name); // 409 = already running
++      void refreshList();
++    } catch {
++      /* surfaced by the next list/output poll */
++    }
++  };
++
++  const handleStop = async (name: string): Promise<void> => {
++    try {
++      await fetch('/api/scripts/stop', {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ name }),
++      });
++    } finally {
++      void refreshList();
++    }
++  };
++
++  return (
++    <Drawer
++      title='脚本'
++      visible={open}
++      onCancel={onClose}
++      placement='right'
++      width={isMobile ? '100%' : 920}
++      footer={null}
++      unmountOnExit={false}
++    >
++      <div className='flex flex-col gap-16px'>
++        {scripts.length === 0 && (
++          <Empty description='暂无脚本 — 将 .sh / .mjs / .py 文件放入容器的 /data/scripts.d/ 目录' />
++        )}
++        {scripts.map((s) => {
++          const out = outputs[s.name];
++          const exited = out !== undefined && out.exitCode !== undefined && out.exitCode !== null;
++          return (
++            <div key={s.name} className='rd-8px border border-solid border-fill-2 p-12px flex flex-col gap-8px'>
++              <div className='flex items-center gap-8px'>
++                <span className='text-14px font-500 text-t-primary'>{s.meta?.name ?? s.name}</span>
++                {s.running && (
++                  <Tag size='small' color='arcoblue'>
++                    运行中
++                  </Tag>
++                )}
++                {exited && (
++                  <Tag size='small' color={out.exitCode === 0 ? 'green' : 'red'}>
++                    exit {out.exitCode}
++                  </Tag>
++                )}
++                <div className='flex-1' />
++                {s.running ? (
++                  <Button size='mini' status='danger' onClick={() => void handleStop(s.name)}>
++                    停止
++                  </Button>
++                ) : (
++                  <Button size='mini' type='primary' onClick={() => void handleRun(s.name)}>
++                    运行
++                  </Button>
++                )}
++              </div>
++              {s.meta?.desc && <div className='text-12px text-t-secondary'>{s.meta.desc}</div>}
++              <TextArea
++                value={stdins[s.name] ?? ''}
++                onChange={(v) => setStdin(s.name, v)}
++                placeholder='标准输入（可选，浏览器内自动记忆）'
++                autoSize={{ minRows: 1, maxRows: 6 }}
++              />
++              {out && <OutputView output={out} />}
++            </div>
++          );
++        })}
++      </div>
++    </Drawer>
++  );
++};
++
++type SiderScriptsEntryProps = {
++  isMobile: boolean;
++  collapsed: boolean;
++  siderTooltipProps: SiderTooltipProps;
++};
++
++const SiderScriptsEntry: React.FC<SiderScriptsEntryProps> = ({ isMobile, collapsed, siderTooltipProps }) => {
++  const [open, setOpen] = useState(false);
++  const icon = <Command theme='outline' size='20' fill='currentColor' className='block leading-none shrink-0' style={{ lineHeight: 0 }} />;
++
++  if (collapsed) {
++    return (
++      <>
++        <Tooltip {...siderTooltipProps} content='脚本' position='right'>
++          <div
++            className={classNames(
++              'w-full h-34px flex items-center justify-center cursor-pointer transition-colors rd-8px text-t-primary',
++              'hover:bg-fill-3 active:bg-fill-4'
++            )}
++            onClick={() => setOpen(true)}
++          >
++            {icon}
++          </div>
++        </Tooltip>
++        <ScriptsPanel open={open} onClose={() => setOpen(false)} isMobile={isMobile} />
++      </>
++    );
++  }
++
++  return (
++    <>
++      <Tooltip {...siderTooltipProps} content='脚本' position='right'>
++        <div
++          className={classNames(
++            'box-border group h-34px w-full flex items-center justify-start gap-8px pl-10px pr-8px rd-0.5rem cursor-pointer shrink-0 transition-all text-t-primary',
++            isMobile && 'sider-action-btn-mobile',
++            'hover:bg-fill-3 active:bg-fill-4'
++          )}
++          onClick={() => setOpen(true)}
++        >
++          <span className='size-22px flex items-center justify-center shrink-0 text-t-primary'>
++            <Command theme='outline' size='16' fill='currentColor' className='block leading-none' style={{ lineHeight: 0 }} />
++          </span>
++          <span className='collapsed-hidden text-t-primary text-14px font-[500] leading-24px'>脚本</span>
++        </div>
++      </Tooltip>
++      <ScriptsPanel open={open} onClose={() => setOpen(false)} isMobile={isMobile} />
++    </>
++  );
++};
++
++export default SiderScriptsEntry;
+diff --git a/packages/desktop/src/renderer/components/layout/Sider/index.tsx b/packages/desktop/src/renderer/components/layout/Sider/index.tsx
+index c906308..c2c543c 100644
+--- a/packages/desktop/src/renderer/components/layout/Sider/index.tsx
++++ b/packages/desktop/src/renderer/components/layout/Sider/index.tsx
+@@ -9,6 +9,7 @@ import { blurActiveElement } from '@renderer/utils/ui/focus';
+ import { useThemeContext } from '@renderer/hooks/context/ThemeContext';
+ import { SiderToolbar, SiderSearchEntry, SiderScheduledEntry, SiderAssistantEntry } from './SiderNav';
+ import SiderTerminalEntry from './SiderNav/SiderTerminalEntry'; // self-hosted patch 0003
++import SiderScriptsEntry from './SiderNav/SiderScriptsEntry'; // self-hosted patch 0005
+ import SiderFooter from './SiderFooter';
+ import TeamSiderSection from './TeamSiderSection';
+ import siderStyles from './Sider.module.css';
+@@ -219,6 +220,8 @@ const Sider: React.FC<SiderProps> = ({ onSessionClick, collapsed = false }) => {
+             />
+             {/* Self-hosted patch 0003: in-app terminal (ttyd sidecar) entry */}
+             <SiderTerminalEntry isMobile={isMobile} collapsed={collapsed} siderTooltipProps={siderTooltipProps} />
++            {/* Self-hosted patch 0005: custom scripts panel entry */}
++            <SiderScriptsEntry isMobile={isMobile} collapsed={collapsed} siderTooltipProps={siderTooltipProps} />
+             {/* Divider between fixed top nav and scrollable content area */}
+             <div
+               className={classNames(

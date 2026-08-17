@@ -1,0 +1,198 @@
+diff --git a/packages/web-host/src/static-server.ts b/packages/web-host/src/static-server.ts
+index 86f1a5c..13bbf80 100644
+--- a/packages/web-host/src/static-server.ts
++++ b/packages/web-host/src/static-server.ts
+@@ -10,9 +10,12 @@
+  * Design: Node native http + serve-handler. No Express. No business routes.
+  */
+ 
++import { spawn, type ChildProcess } from 'node:child_process';
+ import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+ import { networkInterfaces } from 'node:os';
+ import net, { type Socket } from 'node:net';
++import fs from 'node:fs';
++import path from 'node:path';
+ import serveHandler from 'serve-handler';
+ 
+ export type StaticServerOptions = {
+@@ -228,6 +231,166 @@ function peekHeaderValue(buf: Buffer, name: string): string | undefined {
+   return undefined;
+ }
+ 
++// --- custom scripts API (self-hosted addition) -----------------------------
++// /api/scripts/* is served locally, BEFORE the /api/* proxy below, and gated
++// on a logged-in aionui session — same backendSessionValid probe the ttyd
++// sidecar uses. Scripts live in AIONUI_SCRIPTS_DIR (default /data/scripts.d,
++// a mounted volume) as plain files; metadata comes from `# name:` / `# desc:`
++// comment heads (or `//` for .mjs). Each run spawns the interpreter picked by
++// the file extension (no shell, no user-chosen argv — the attack surface is
++// "run a file that is already on this volume"), tees combined stdout/stderr
++// to AIONUI_SCRIPTS_OUT_DIR/<name>.log and is polled by the UI. Interpretation
++// of the last output line as a view JSON ({type:"table"|"progress"}) happens
++// in the frontend, not here. Runs survive a web restart (detached process
++// group) but their in-memory status does not — the UI just sees running=false.
++const SCRIPTS_DIR = process.env.AIONUI_SCRIPTS_DIR ?? '/data/scripts.d';
++const SCRIPTS_OUT_DIR = process.env.AIONUI_SCRIPTS_OUT_DIR ?? '/data/scripts-output';
++const SCRIPT_INTERPRETERS: Record<string, string> = { '.sh': 'bash', '.mjs': 'node', '.py': 'python3' };
++const SCRIPT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
++
++type RunningScript = { proc: ChildProcess; startedAt: number; exitCode?: number | null };
++const runningScripts = new Map<string, RunningScript>();
++
++function scriptOutputPath(name: string): string {
++  return path.join(SCRIPTS_OUT_DIR, `${name}.log`);
++}
++
++/** Parse `# name:` / `# desc:` (or `//` for JS) comments from the script head. */
++function parseScriptMeta(content: string): { name?: string; desc?: string } {
++  const meta: { name?: string; desc?: string } = {};
++  for (const line of content.split('\n', 40)) {
++    const m = line.match(/^\s*(?:#|\/\/)\s*(name|desc)\s*:\s*(.+?)\s*$/i);
++    if (m && !meta[m[1].toLowerCase() as 'name' | 'desc']) {
++      meta[m[1].toLowerCase() as 'name' | 'desc'] = m[2];
++    }
++  }
++  return meta;
++}
++
++function listScripts(): unknown[] {
++  fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
++  const out: unknown[] = [];
++  for (const file of fs.readdirSync(SCRIPTS_DIR).sort()) {
++    const interpreter = SCRIPT_INTERPRETERS[path.extname(file)];
++    if (!interpreter) continue;
++    const record = runningScripts.get(file);
++    const running = record !== undefined && record.exitCode === undefined;
++    out.push({
++      name: file,
++      meta: parseScriptMeta(fs.readFileSync(path.join(SCRIPTS_DIR, file), 'utf8')),
++      running,
++      startedAt: running ? record?.startedAt : undefined,
++      exitCode: record?.exitCode,
++    });
++  }
++  return out;
++}
++
++/** Spawn a script: own process group, output tee'd to its log, optional stdin. */
++function startScript(name: string, stdin: string | undefined): void {
++  const interpreter = SCRIPT_INTERPRETERS[path.extname(name)];
++  const file = path.join(SCRIPTS_DIR, name);
++  if (!interpreter || !fs.existsSync(file)) throw new Error('UNKNOWN_SCRIPT');
++  const prev = runningScripts.get(name);
++  if (prev !== undefined && prev.exitCode === undefined) throw new Error('ALREADY_RUNNING');
++  fs.mkdirSync(SCRIPTS_OUT_DIR, { recursive: true });
++  const log = fs.createWriteStream(scriptOutputPath(name), { flags: 'w' });
++  const proc = spawn(interpreter, [file], {
++    cwd: SCRIPTS_DIR, // scripts read sibling files (.env) relative to themselves
++    detached: true, // own process group → stop() can SIGTERM the whole group
++    env: process.env, // inherit HOME etc. so tools like `gh` find their config
++    stdio: ['pipe', 'pipe', 'pipe'],
++  });
++  proc.stdout?.pipe(log);
++  proc.stderr?.pipe(log);
++  const record: RunningScript = { proc, startedAt: Date.now() };
++  runningScripts.set(name, record);
++  proc.on('close', (code) => {
++    record.exitCode = code ?? -1;
++    log.end();
++  });
++  proc.on('error', (err) => {
++    log.write(`\n[spawn error] ${String(err)}\n`);
++    record.exitCode = -1;
++    log.end();
++  });
++  proc.stdin?.end(stdin ?? '');
++}
++
++function stopScript(name: string): void {
++  const record = runningScripts.get(name);
++  if (!record || record.exitCode !== undefined) return;
++  const pid = record.proc.pid;
++  try {
++    if (pid) process.kill(-pid, 'SIGTERM'); // negative pid = the whole group
++    else record.proc.kill('SIGTERM');
++  } catch {
++    try {
++      record.proc.kill('SIGTERM');
++    } catch {
++      /* already gone */
++    }
++  }
++}
++
++function readBody(req: IncomingMessage): Promise<string> {
++  return new Promise((resolve, reject) => {
++    const chunks: Buffer[] = [];
++    req.on('data', (chunk) => chunks.push(chunk));
++    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
++    req.on('error', reject);
++  });
++}
++
++/** Local routes for /api/scripts/* — must be checked before the /api/* proxy. */
++async function handleScriptsApi(req: IncomingMessage, res: ServerResponse, backendPort: number): Promise<void> {
++  const send = (status: number, body: unknown): void => {
++    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
++    res.end(JSON.stringify(body));
++  };
++  if (!(await backendSessionValid(req.headers.cookie, backendPort))) {
++    res.writeHead(401).end('unauthorized');
++    return;
++  }
++  const url = new URL(req.url ?? '/', 'http://localhost');
++  const sub = url.pathname.replace(/^\/api\/scripts\/?/, '').replace(/\/+$/, '');
++  const name = (url.searchParams.get('name') ?? '').trim();
++
++  if (req.method === 'GET' && sub === 'list') {
++    send(200, { scripts: listScripts() });
++  } else if (req.method === 'GET' && sub === 'output' && SCRIPT_NAME_RE.test(name)) {
++    let content = '';
++    try {
++      content = fs.readFileSync(scriptOutputPath(name), 'utf8');
++    } catch {
++      /* not run yet */
++    }
++    if (content.length > 128 * 1024) content = content.slice(-128 * 1024); // keep the tail
++    const record = runningScripts.get(name);
++    const running = record !== undefined && record.exitCode === undefined;
++    send(200, { name, running, exitCode: record?.exitCode, content });
++  } else if (req.method === 'POST' && sub === 'run') {
++    const body = JSON.parse((await readBody(req)) || '{}') as { name?: string; stdin?: string };
++    const target = String(body.name ?? '').trim();
++    if (!SCRIPT_NAME_RE.test(target)) return send(400, { error: 'BAD_SCRIPT_NAME' });
++    try {
++      startScript(target, typeof body.stdin === 'string' ? body.stdin : undefined);
++      send(200, { ok: true, name: target });
++    } catch (e) {
++      const msg = String((e as Error)?.message ?? e);
++      send(msg === 'ALREADY_RUNNING' ? 409 : 404, { error: msg });
++    }
++  } else if (req.method === 'POST' && sub === 'stop') {
++    const body = JSON.parse((await readBody(req)) || '{}') as { name?: string };
++    const target = String(body.name ?? '').trim();
++    if (!SCRIPT_NAME_RE.test(target)) return send(400, { error: 'BAD_SCRIPT_NAME' });
++    stopScript(target);
++    send(200, { ok: true, name: target });
++  } else {
++    send(404, { error: 'NOT_FOUND' });
++  }
++}
++
+ export async function startStaticServer(opts: StaticServerOptions): Promise<StaticServerHandle> {
+   const port = opts.port ?? DEFAULT_PORT;
+   const allowRemote = opts.allowRemote === true;
+@@ -249,6 +412,13 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+         return;
+       }
+ 
++      // /api/scripts/* — local script runner (self-hosted addition). Checked
++      // BEFORE the catch-all /api/* proxy below; same session gate as ttyd.
++      if (req.url === '/api/scripts' || req.url.startsWith('/api/scripts/')) {
++        await handleScriptsApi(req, res, opts.backendPort);
++        return;
++      }
++
+       // /api/* — reverse proxy to backend (includes /api/auth/*).
+       // /login and /logout are aionui-auth's top-level auth endpoints: proxy them too
+       // so WebUI browser clients reach the backend without a path-rewrite.

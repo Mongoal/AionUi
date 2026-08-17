@@ -30,9 +30,13 @@ on:
         description: 'Boot the tarball in debian:bookworm-slim after build'
         type: boolean
         default: true
+      publish_release:
+        description: 'Also attach the tarball to a prerelease (proxy-friendly download URL, saves mirror bandwidth)'
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   BUN_INSTALL_REGISTRY: 'https://registry.npmjs.org/'
@@ -148,6 +152,32 @@ jobs:
             dist-web-cli/*.sha256
           retention-days: 30
           if-no-files-found: error
+
+      # Why a release alongside the artifact: Actions artifact downloads go
+      # through api.github.com signed URLs (objects.githubusercontent.com),
+      # which GitHub mirrors (cdn.gh-proxy.org etc.) do NOT proxy. Release
+      # assets have stable github.com/.../releases/download/ URLs that every
+      # mirror handles — the NAS can pull the 133MB tarball without burning
+      # proxy traffic. Tag format build-<version>-<run_id> matches what
+      # upgrade.sh reconstructs locally from the run id.
+      - name: Attach tarball to a prerelease (mirror-friendly URL)
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rtag="build-${{ steps.meta.outputs.asset_version }}-${GITHUB_RUN_ID}"
+          gh release create "$rtag" dist-web-cli/*.tar.gz dist-web-cli/*.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "web build ${{ steps.meta.outputs.tag }} (run ${GITHUB_RUN_ID})" \
+            --notes "Automated build of upstream ${{ steps.meta.outputs.tag }} with build-patches. Mirror prefix any GitHub proxy, e.g. cdn.gh-proxy.org." \
+            --prerelease
+          # keep only the newest 5 build-* releases (numeric order by run id)
+          gh release list --repo "$GITHUB_REPOSITORY" --json tagName \
+            --jq '[.[].tagName] | map(select(startswith("build-"))) | sort_by(. | split("-") | last | tonumber) | .[0:-5][]' \
+            | while read -r old; do
+                echo "deleting old release $old"
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes
+              done
 
   smoke:
     name: smoke test (debian boot check)

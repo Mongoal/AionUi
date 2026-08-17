@@ -1,9 +1,9 @@
 diff --git a/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx
 new file mode 100644
-index 0000000..7a0f21b
+index 0000000..0125e62
 --- /dev/null
 +++ b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,364 @@
 +/**
 + * @license
 + * Copyright 2026 AionUi (aionui.com)
@@ -32,6 +32,9 @@ index 0000000..7a0f21b
 +type ScriptInfo = {
 +  name: string;
 +  meta?: { name?: string; desc?: string };
++  /** Default stdin from the script's declared `# input-file:` — present only
++   * for scripts that take input; absent means no stdin box in the panel. */
++  input?: string;
 +  running?: boolean;
 +  startedAt?: number;
 +  exitCode?: number | null;
@@ -179,8 +182,8 @@ index 0000000..7a0f21b
 +    [fetchOutput, refreshList, stopPolling]
 +  );
 +
-+  // On open: load the list, restore stdin memories, fetch last outputs and
-+  // resume polling for scripts that are still running.
++  // On open: load the list, seed stdin boxes (localStorage memory wins over the
++  // declared default), fetch last outputs and resume polling for running ones.
 +  useEffect(() => {
 +    if (!open) return;
 +    void refreshList();
@@ -188,13 +191,15 @@ index 0000000..7a0f21b
 +      const res = await fetch('/api/scripts/list');
 +      if (!res.ok) return;
 +      for (const s of ((await res.json()) as { scripts?: ScriptInfo[] }).scripts ?? []) {
-+        let saved: string | null = null;
-+        try {
-+          saved = localStorage.getItem(stdinStorageKey(s.name));
-+        } catch {
-+          /* private mode */
++        if (s.input !== undefined) {
++          let saved: string | null = null;
++          try {
++            saved = localStorage.getItem(stdinStorageKey(s.name));
++          } catch {
++            /* private mode */
++          }
++          setStdins((prev) => ({ ...prev, [s.name]: saved !== null ? saved : s.input }));
 +        }
-+        if (saved !== null) setStdins((prev) => ({ ...prev, [s.name]: saved }));
 +        const out = await fetchOutput(s.name);
 +        if (out) {
 +          setOutputs((prev) => ({ ...prev, [s.name]: out }));
@@ -291,12 +296,17 @@ index 0000000..7a0f21b
 +                )}
 +              </div>
 +              {s.meta?.desc && <div className='text-12px text-t-secondary'>{s.meta.desc}</div>}
-+              <TextArea
-+                value={stdins[s.name] ?? ''}
-+                onChange={(v) => setStdin(s.name, v)}
-+                placeholder='标准输入（可选，浏览器内自动记忆）'
-+                autoSize={{ minRows: 1, maxRows: 6 }}
-+              />
++              {/* Only scripts that declared an input file get a stdin box —
++                  seeded with the file's content so the list is visible and
++                  directly editable; the edited box overrides the file for the run. */}
++              {s.input !== undefined && (
++                <TextArea
++                  value={stdins[s.name] ?? ''}
++                  onChange={(v) => setStdin(s.name, v)}
++                  placeholder='输入（自动记忆）'
++                  autoSize={{ minRows: 2, maxRows: 8 }}
++                />
++              )}
 +              {out && <OutputView output={out} />}
 +            </div>
 +          );

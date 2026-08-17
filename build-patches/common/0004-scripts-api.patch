@@ -1,5 +1,5 @@
 diff --git a/packages/web-host/src/static-server.ts b/packages/web-host/src/static-server.ts
-index 86f1a5c..5b6e25a 100644
+index 86f1a5c..ac7dd46 100644
 --- a/packages/web-host/src/static-server.ts
 +++ b/packages/web-host/src/static-server.ts
 @@ -10,9 +10,12 @@
@@ -15,7 +15,7 @@ index 86f1a5c..5b6e25a 100644
  import serveHandler from 'serve-handler';
  
  export type StaticServerOptions = {
-@@ -228,6 +231,192 @@ function peekHeaderValue(buf: Buffer, name: string): string | undefined {
+@@ -228,6 +231,206 @@ function peekHeaderValue(buf: Buffer, name: string): string | undefined {
    return undefined;
  }
  
@@ -73,13 +73,14 @@ index 86f1a5c..5b6e25a 100644
 +  return path.join(SCRIPTS_OUT_DIR, `${name}.log`);
 +}
 +
-+/** Parse `# name:` / `# desc:` (or `//` for JS) comments from the entry's head. */
-+function parseScriptMeta(content: string): { name?: string; desc?: string } {
-+  const meta: { name?: string; desc?: string } = {};
++/** Parse `# name:` / `# desc:` / `# input-file:` (or `//` for JS) comments from the entry's head. */
++function parseScriptMeta(content: string): { name?: string; desc?: string; inputFile?: string } {
++  const meta: { name?: string; desc?: string; inputFile?: string } = {};
 +  for (const line of content.split('\n', 40)) {
-+    const m = line.match(/^\s*(?:#|\/\/)\s*(name|desc)\s*:\s*(.+?)\s*$/i);
-+    if (m && !meta[m[1].toLowerCase() as 'name' | 'desc']) {
-+      meta[m[1].toLowerCase() as 'name' | 'desc'] = m[2];
++    const m = line.match(/^\s*(?:#|\/\/)\s*(name|desc|input-file)\s*:\s*(.+?)\s*$/i);
++    if (m) {
++      const key = m[1].toLowerCase() as 'name' | 'desc' | 'inputFile';
++      if (!meta[key]) meta[key] = m[2];
 +    }
 +  }
 +  return meta;
@@ -90,9 +91,22 @@ index 86f1a5c..5b6e25a 100644
 +  for (const entry of scanScripts()) {
 +    const record = runningScripts.get(entry.name);
 +    const running = record !== undefined && record.exitCode === undefined;
++    const meta = parseScriptMeta(fs.readFileSync(entry.file, 'utf8'));
++    // A declared input file (relative to the entry dir) becomes the panel's
++    // default stdin: the list shows it, edits in the panel override it for
++    // that run. Scripts without a declaration get no stdin box at all.
++    let input: string | undefined;
++    if (meta.inputFile && /^[^/\\]+$/.test(meta.inputFile)) {
++      try {
++        input = fs.readFileSync(path.join(entry.dir, meta.inputFile), 'utf8').slice(0, 8192);
++      } catch {
++        /* declared but absent — leave undefined */
++      }
++    }
 +    out.push({
 +      name: entry.name,
-+      meta: parseScriptMeta(fs.readFileSync(entry.file, 'utf8')),
++      meta: { name: meta.name, desc: meta.desc },
++      input,
 +      running,
 +      startedAt: running ? record?.startedAt : undefined,
 +      exitCode: record?.exitCode,
@@ -208,7 +222,7 @@ index 86f1a5c..5b6e25a 100644
  export async function startStaticServer(opts: StaticServerOptions): Promise<StaticServerHandle> {
    const port = opts.port ?? DEFAULT_PORT;
    const allowRemote = opts.allowRemote === true;
-@@ -249,6 +438,13 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+@@ -249,6 +452,13 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
          return;
        }
  

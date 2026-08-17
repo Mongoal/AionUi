@@ -1,5 +1,5 @@
 diff --git a/packages/web-host/src/static-server.ts b/packages/web-host/src/static-server.ts
-index 86f1a5c..ac7dd46 100644
+index 86f1a5c..ce2386c 100644
 --- a/packages/web-host/src/static-server.ts
 +++ b/packages/web-host/src/static-server.ts
 @@ -10,9 +10,12 @@
@@ -15,7 +15,7 @@ index 86f1a5c..ac7dd46 100644
  import serveHandler from 'serve-handler';
  
  export type StaticServerOptions = {
-@@ -228,6 +231,206 @@ function peekHeaderValue(buf: Buffer, name: string): string | undefined {
+@@ -228,6 +231,212 @@ function peekHeaderValue(buf: Buffer, name: string): string | undefined {
    return undefined;
  }
  
@@ -74,13 +74,17 @@ index 86f1a5c..ac7dd46 100644
 +}
 +
 +/** Parse `# name:` / `# desc:` / `# input-file:` (or `//` for JS) comments from the entry's head. */
++const SCRIPT_META_KEYS = { name: 'name', desc: 'desc', 'input-file': 'inputFile' } as const;
++
 +function parseScriptMeta(content: string): { name?: string; desc?: string; inputFile?: string } {
 +  const meta: { name?: string; desc?: string; inputFile?: string } = {};
 +  for (const line of content.split('\n', 40)) {
 +    const m = line.match(/^\s*(?:#|\/\/)\s*(name|desc|input-file)\s*:\s*(.+?)\s*$/i);
 +    if (m) {
-+      const key = m[1].toLowerCase() as 'name' | 'desc' | 'inputFile';
-+      if (!meta[key]) meta[key] = m[2];
++      // toLowerCase alone keeps the hyphen ('input-file'); map it explicitly
++      // to the camelCase field or the declaration silently never matches.
++      const key = SCRIPT_META_KEYS[m[1].toLowerCase() as keyof typeof SCRIPT_META_KEYS];
++      if (key && !meta[key]) meta[key] = m[2];
 +    }
 +  }
 +  return meta;
@@ -89,28 +93,30 @@ index 86f1a5c..ac7dd46 100644
 +function listScripts(): unknown[] {
 +  const out: unknown[] = [];
 +  for (const entry of scanScripts()) {
-+    const record = runningScripts.get(entry.name);
-+    const running = record !== undefined && record.exitCode === undefined;
-+    const meta = parseScriptMeta(fs.readFileSync(entry.file, 'utf8'));
-+    // A declared input file (relative to the entry dir) becomes the panel's
-+    // default stdin: the list shows it, edits in the panel override it for
-+    // that run. Scripts without a declaration get no stdin box at all.
-+    let input: string | undefined;
-+    if (meta.inputFile && /^[^/\\]+$/.test(meta.inputFile)) {
-+      try {
++    // One broken script (unreadable entry, weird metadata) must not blank the
++    // whole list — skip the entry and keep going.
++    try {
++      const record = runningScripts.get(entry.name);
++      const running = record !== undefined && record.exitCode === undefined;
++      const meta = parseScriptMeta(fs.readFileSync(entry.file, 'utf8'));
++      // A declared input file (relative to the entry dir) becomes the panel's
++      // default stdin: the list shows it, edits in the panel override it for
++      // that run. Scripts without a declaration get no stdin box at all.
++      let input: string | undefined;
++      if (meta.inputFile && /^[^/\\]+$/.test(meta.inputFile)) {
 +        input = fs.readFileSync(path.join(entry.dir, meta.inputFile), 'utf8').slice(0, 8192);
-+      } catch {
-+        /* declared but absent — leave undefined */
 +      }
++      out.push({
++        name: entry.name,
++        meta: { name: meta.name, desc: meta.desc },
++        input,
++        running,
++        startedAt: running ? record?.startedAt : undefined,
++        exitCode: record?.exitCode,
++      });
++    } catch {
++      /* skip unreadable entry */
 +    }
-+    out.push({
-+      name: entry.name,
-+      meta: { name: meta.name, desc: meta.desc },
-+      input,
-+      running,
-+      startedAt: running ? record?.startedAt : undefined,
-+      exitCode: record?.exitCode,
-+    });
 +  }
 +  return out;
 +}
@@ -222,7 +228,7 @@ index 86f1a5c..ac7dd46 100644
  export async function startStaticServer(opts: StaticServerOptions): Promise<StaticServerHandle> {
    const port = opts.port ?? DEFAULT_PORT;
    const allowRemote = opts.allowRemote === true;
-@@ -249,6 +452,13 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+@@ -249,6 +458,13 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
          return;
        }
  

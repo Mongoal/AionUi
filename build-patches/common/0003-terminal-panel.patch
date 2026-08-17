@@ -1,9 +1,9 @@
 diff --git a/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderTerminalEntry.tsx b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderTerminalEntry.tsx
 new file mode 100644
-index 0000000..2d9f09c
+index 0000000..ed2ebed
 --- /dev/null
 +++ b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderTerminalEntry.tsx
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,103 @@
 +/**
 + * @license
 + * Copyright 2026 AionUi (aionui.com)
@@ -15,13 +15,12 @@ index 0000000..2d9f09c
 +// served at /ttyd/ by the patched static-server — credentials are injected
 +// server-side, the browser never sees them. ttyd spawns tmux (`new -A -s main`),
 +// so the shell survives disconnects, drawer closes and page reloads. The drawer
-+// header is custom-drawn (Arco's header is disabled) so the 收起 (collapse)
-+// button reliably sits at the far right — closing only hides, never kills the
-+// session. Not an upstream component; the label is intentionally hardcoded (no
-+// i18n keys) to keep the patch conflict-free.
++// uses Arco's stock header (title + X); closing only hides — the session lives
++// in tmux server-side. Not an upstream component; the label is intentionally
++// hardcoded (no i18n keys) to keep the patch conflict-free.
 +
 +import React, { useState } from 'react';
-+import { Button, Drawer, Tooltip } from '@arco-design/web-react';
++import { Drawer, Tooltip } from '@arco-design/web-react';
 +import { Terminal } from '@icon-park/react';
 +import classNames from 'classnames';
 +import type { SiderTooltipProps } from '@renderer/utils/ui/siderTooltip';
@@ -32,14 +31,12 @@ index 0000000..2d9f09c
 +  isMobile: boolean;
 +};
 +
-+/** Right-side drawer hosting the ttyd terminal. Custom header row keeps the
-+ * 收起 button flush right (Arco's title container doesn't stretch, so a
-+ * justify-between inside `title` is not reliable). Closing only hides the
-+ * iframe (Arco keeps children mounted) and the shell lives in tmux server-side
-+ * anyway — close/reopen/backgrounding never lose the session. */
++/** Right-side drawer hosting the ttyd terminal. Closing (X / ESC / mask) only
++ * hides the iframe (Arco keeps children mounted) and the shell lives in tmux
++ * server-side anyway — close/reopen/backgrounding never lose the session. */
 +const TerminalPanel: React.FC<TerminalPanelProps> = ({ open, onClose, isMobile }) => (
 +  <Drawer
-+    header={null}
++    title='终端'
 +    visible={open}
 +    onCancel={onClose}
 +    placement='right'
@@ -47,20 +44,12 @@ index 0000000..2d9f09c
 +    footer={null}
 +    bodyStyle={{ padding: 0 }}
 +  >
-+    <div className='flex flex-col h-full'>
-+      <div className='flex items-center justify-between h-40px px-16px shrink-0 border-b border-solid border-fill-2'>
-+        <span className='text-14px font-500 text-t-primary'>终端</span>
-+        <Button type='text' size='mini' onClick={onClose}>
-+          收起
-+        </Button>
-+      </div>
-+      <iframe
-+        src='/ttyd/'
-+        title='terminal'
-+        className='flex-1 w-full border-none bg-black'
-+        allow='clipboard-read; clipboard-write'
-+      />
-+    </div>
++    <iframe
++      src='/ttyd/'
++      title='terminal'
++      className='w-full h-full border-none bg-black'
++      allow='clipboard-read; clipboard-write'
++    />
 +  </Drawer>
 +);
 +

@@ -1,5 +1,5 @@
 diff --git a/packages/web-host/src/static-server.ts b/packages/web-host/src/static-server.ts
-index 86f1a5c..13bbf80 100644
+index 86f1a5c..5b6e25a 100644
 --- a/packages/web-host/src/static-server.ts
 +++ b/packages/web-host/src/static-server.ts
 @@ -10,9 +10,12 @@
@@ -15,26 +15,56 @@ index 86f1a5c..13bbf80 100644
  import serveHandler from 'serve-handler';
  
  export type StaticServerOptions = {
-@@ -228,6 +231,166 @@ function peekHeaderValue(buf: Buffer, name: string): string | undefined {
+@@ -228,6 +231,192 @@ function peekHeaderValue(buf: Buffer, name: string): string | undefined {
    return undefined;
  }
  
 +// --- custom scripts API (self-hosted addition) -----------------------------
 +// /api/scripts/* is served locally, BEFORE the /api/* proxy below, and gated
 +// on a logged-in aionui session — same backendSessionValid probe the ttyd
-+// sidecar uses. Scripts live in AIONUI_SCRIPTS_DIR (default /data/scripts.d,
-+// a mounted volume) as plain files; metadata comes from `# name:` / `# desc:`
-+// comment heads (or `//` for .mjs). Each run spawns the interpreter picked by
-+// the file extension (no shell, no user-chosen argv — the attack surface is
-+// "run a file that is already on this volume"), tees combined stdout/stderr
-+// to AIONUI_SCRIPTS_OUT_DIR/<name>.log and is polled by the UI. Interpretation
-+// of the last output line as a view JSON ({type:"table"|"progress"}) happens
-+// in the frontend, not here. Runs survive a web restart (detached process
-+// group) but their in-memory status does not — the UI just sees running=false.
++// sidecar uses. Two layouts are supported in AIONUI_SCRIPTS_DIR (default
++// /data/scripts.d, a mounted volume):
++//   <name>.sh | <name>.mjs | <name>.py   single-file script (name = filename)
++//   <name>/main.{sh,mjs,py}              package script (name = dir name);
++//                                        resources (.env, watchlists, caches)
++//                                        live next to main.* and the run cwd is
++//                                        that directory
++// Metadata comes from `# name:` / `# desc:` comment heads (or `//` for .mjs).
++// Each run spawns the interpreter picked by the entry's extension (no shell,
++// no user-chosen argv — the attack surface is "run a file that is already on
++// this volume"), tees combined stdout/stderr to
++// AIONUI_SCRIPTS_OUT_DIR/<name>.log and is polled by the UI. Interpretation of
++// the last output line as a view JSON ({type:"table"|"progress"}) happens in
++// the frontend, not here. Runs survive a web restart (detached process group)
++// but their in-memory status does not — the UI just sees running=false.
 +const SCRIPTS_DIR = process.env.AIONUI_SCRIPTS_DIR ?? '/data/scripts.d';
 +const SCRIPTS_OUT_DIR = process.env.AIONUI_SCRIPTS_OUT_DIR ?? '/data/scripts-output';
 +const SCRIPT_INTERPRETERS: Record<string, string> = { '.sh': 'bash', '.mjs': 'node', '.py': 'python3' };
 +const SCRIPT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
++
++type ScriptEntry = { name: string; file: string; interpreter: string; dir: string };
++
++/** Discover runnable scripts: top-level *.{sh,mjs,py} files and <dir>/main.* packages. */
++function scanScripts(): ScriptEntry[] {
++  fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
++  const out: ScriptEntry[] = [];
++  const entries = fs.readdirSync(SCRIPTS_DIR, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
++  for (const entry of entries) {
++    if (entry.isFile()) {
++      const interpreter = SCRIPT_INTERPRETERS[path.extname(entry.name)];
++      if (interpreter) out.push({ name: entry.name, file: path.join(SCRIPTS_DIR, entry.name), interpreter, dir: SCRIPTS_DIR });
++    } else if (entry.isDirectory()) {
++      for (const ext of ['.sh', '.mjs', '.py']) {
++        const file = path.join(SCRIPTS_DIR, entry.name, `main${ext}`);
++        if (fs.existsSync(file)) {
++          out.push({ name: entry.name, file, interpreter: SCRIPT_INTERPRETERS[ext], dir: path.dirname(file) });
++          break;
++        }
++      }
++    }
++  }
++  return out;
++}
 +
 +type RunningScript = { proc: ChildProcess; startedAt: number; exitCode?: number | null };
 +const runningScripts = new Map<string, RunningScript>();
@@ -43,7 +73,7 @@ index 86f1a5c..13bbf80 100644
 +  return path.join(SCRIPTS_OUT_DIR, `${name}.log`);
 +}
 +
-+/** Parse `# name:` / `# desc:` (or `//` for JS) comments from the script head. */
++/** Parse `# name:` / `# desc:` (or `//` for JS) comments from the entry's head. */
 +function parseScriptMeta(content: string): { name?: string; desc?: string } {
 +  const meta: { name?: string; desc?: string } = {};
 +  for (const line of content.split('\n', 40)) {
@@ -56,16 +86,13 @@ index 86f1a5c..13bbf80 100644
 +}
 +
 +function listScripts(): unknown[] {
-+  fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
 +  const out: unknown[] = [];
-+  for (const file of fs.readdirSync(SCRIPTS_DIR).sort()) {
-+    const interpreter = SCRIPT_INTERPRETERS[path.extname(file)];
-+    if (!interpreter) continue;
-+    const record = runningScripts.get(file);
++  for (const entry of scanScripts()) {
++    const record = runningScripts.get(entry.name);
 +    const running = record !== undefined && record.exitCode === undefined;
 +    out.push({
-+      name: file,
-+      meta: parseScriptMeta(fs.readFileSync(path.join(SCRIPTS_DIR, file), 'utf8')),
++      name: entry.name,
++      meta: parseScriptMeta(fs.readFileSync(entry.file, 'utf8')),
 +      running,
 +      startedAt: running ? record?.startedAt : undefined,
 +      exitCode: record?.exitCode,
@@ -76,15 +103,14 @@ index 86f1a5c..13bbf80 100644
 +
 +/** Spawn a script: own process group, output tee'd to its log, optional stdin. */
 +function startScript(name: string, stdin: string | undefined): void {
-+  const interpreter = SCRIPT_INTERPRETERS[path.extname(name)];
-+  const file = path.join(SCRIPTS_DIR, name);
-+  if (!interpreter || !fs.existsSync(file)) throw new Error('UNKNOWN_SCRIPT');
++  const entry = scanScripts().find((s) => s.name === name);
++  if (!entry) throw new Error('UNKNOWN_SCRIPT');
 +  const prev = runningScripts.get(name);
 +  if (prev !== undefined && prev.exitCode === undefined) throw new Error('ALREADY_RUNNING');
 +  fs.mkdirSync(SCRIPTS_OUT_DIR, { recursive: true });
 +  const log = fs.createWriteStream(scriptOutputPath(name), { flags: 'w' });
-+  const proc = spawn(interpreter, [file], {
-+    cwd: SCRIPTS_DIR, // scripts read sibling files (.env) relative to themselves
++  const proc = spawn(entry.interpreter, [entry.file], {
++    cwd: entry.dir, // package scripts read sibling resources relative to themselves
 +    detached: true, // own process group → stop() can SIGTERM the whole group
 +    env: process.env, // inherit HOME etc. so tools like `gh` find their config
 +    stdio: ['pipe', 'pipe', 'pipe'],
@@ -182,7 +208,7 @@ index 86f1a5c..13bbf80 100644
  export async function startStaticServer(opts: StaticServerOptions): Promise<StaticServerHandle> {
    const port = opts.port ?? DEFAULT_PORT;
    const allowRemote = opts.allowRemote === true;
-@@ -249,6 +412,13 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
+@@ -249,6 +438,13 @@ export async function startStaticServer(opts: StaticServerOptions): Promise<Stat
          return;
        }
  

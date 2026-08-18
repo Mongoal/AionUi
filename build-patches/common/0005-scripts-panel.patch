@@ -1,9 +1,9 @@
 diff --git a/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx
 new file mode 100644
-index 0000000..0125e62
+index 0000000..055d924
 --- /dev/null
 +++ b/packages/desktop/src/renderer/components/layout/Sider/SiderNav/SiderScriptsEntry.tsx
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,359 @@
 +/**
 + * @license
 + * Copyright 2026 AionUi (aionui.com)
@@ -17,7 +17,11 @@ index 0000000..0125e62
 +// WebUI. A script's last stdout line may be a view JSON: {type:"table"} renders
 +// an Arco Table, {type:"progress"} renders progress bars plus an optional
 +// detail table; anything else falls back to a <pre>. Optional stdin is sent on
-+// run and remembered per script in localStorage. Not an upstream component;
++// run. The stdin box, when a script declares `# input-file:`, is seeded from
++// the SERVER-side file on every panel open (server is the source of truth —
++// browser-side memory is intentionally NOT kept, so editing the file always
++// shows up and all devices see the same defaults); edits in the box only
++// override that single run. Not an upstream component;
 +// labels are intentionally hardcoded (no i18n keys) to keep the patch
 +// conflict-free — same rationale as 0003-terminal-panel.
 +
@@ -134,8 +138,6 @@ index 0000000..0125e62
 +  );
 +};
 +
-+const stdinStorageKey = (name: string): string => `aionui.script.stdin.${name}`;
-+
 +const ScriptsPanel: React.FC<{ open: boolean; onClose: () => void; isMobile: boolean }> = ({ open, onClose, isMobile }) => {
 +  const [scripts, setScripts] = useState<ScriptInfo[]>([]);
 +  const [outputs, setOutputs] = useState<Record<string, OutputState>>({});
@@ -182,8 +184,10 @@ index 0000000..0125e62
 +    [fetchOutput, refreshList, stopPolling]
 +  );
 +
-+  // On open: load the list, seed stdin boxes (localStorage memory wins over the
-+  // declared default), fetch last outputs and resume polling for running ones.
++  // On open: load the list, seed stdin boxes from the SERVER-side declared
++  // input file (source of truth — every open reflects the file as-is, so edits
++  // to the file always show up and every device sees the same defaults), fetch
++  // last outputs and resume polling for running ones.
 +  useEffect(() => {
 +    if (!open) return;
 +    void refreshList();
@@ -192,13 +196,7 @@ index 0000000..0125e62
 +      if (!res.ok) return;
 +      for (const s of ((await res.json()) as { scripts?: ScriptInfo[] }).scripts ?? []) {
 +        if (s.input !== undefined) {
-+          let saved: string | null = null;
-+          try {
-+            saved = localStorage.getItem(stdinStorageKey(s.name));
-+          } catch {
-+            /* private mode */
-+          }
-+          setStdins((prev) => ({ ...prev, [s.name]: saved !== null ? saved : s.input }));
++          setStdins((prev) => ({ ...prev, [s.name]: s.input }));
 +        }
 +        const out = await fetchOutput(s.name);
 +        if (out) {
@@ -218,13 +216,10 @@ index 0000000..0125e62
 +    for (const name of Object.keys(timers.current)) stopPolling(name);
 +  }, [stopPolling]);
 +
++  // Memory-only: the server-side input file is the source of truth; box edits
++  // live until the panel reopens (which re-seeds from the file).
 +  const setStdin = (name: string, value: string): void => {
 +    setStdins((prev) => ({ ...prev, [name]: value }));
-+    try {
-+      localStorage.setItem(stdinStorageKey(name), value);
-+    } catch {
-+      /* private mode — memory-only */
-+    }
 +  };
 +
 +  const handleRun = async (name: string): Promise<void> => {
@@ -303,7 +298,7 @@ index 0000000..0125e62
 +                <TextArea
 +                  value={stdins[s.name] ?? ''}
 +                  onChange={(v) => setStdin(s.name, v)}
-+                  placeholder='输入（自动记忆）'
++                  placeholder='默认取自服务器端文件，编辑仅当次运行生效'
 +                  autoSize={{ minRows: 2, maxRows: 8 }}
 +                />
 +              )}
